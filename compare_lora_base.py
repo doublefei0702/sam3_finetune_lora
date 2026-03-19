@@ -48,7 +48,8 @@ def load_lora_model(config_path, weights_path, device='cuda'):
     model = build_sam3_image_model(
         device=device,
         compile=False,
-        load_from_HF=True,
+        checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+        load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=True
     )
@@ -84,7 +85,8 @@ def load_base_model(device='cuda'):
     model = build_sam3_image_model(
         device=device,
         compile=False,
-        load_from_HF=True,
+        checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+        load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=True
     )
@@ -331,7 +333,7 @@ def main():
 
     if prompt is None:
         print(f"Warning: No ground truth found, using default prompt 'pothole'")
-        prompt = "pothole"
+        prompt = "crate stack"
 
     print(f"Device: {device}")
     print(f"Image: {args.image}")

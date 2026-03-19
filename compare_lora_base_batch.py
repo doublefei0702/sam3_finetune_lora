@@ -45,7 +45,8 @@ def load_lora_model(config_path, weights_path, device='cuda'):
     model = build_sam3_image_model(
         device=device,
         compile=False,
-        load_from_HF=True,
+        checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+        load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=True
     )
@@ -78,7 +79,8 @@ def load_base_model(device='cuda'):
     model = build_sam3_image_model(
         device=device,
         compile=False,
-        load_from_HF=True,
+        checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+        load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=True
     )
@@ -175,10 +177,10 @@ def predict(model, image_path, prompt, resolution=1008, threshold=0.5, device='c
 
 
 def load_ground_truth(image_path, data_dir):
-    """Load ground truth annotations"""
+    """Load ground truth annotations filtered by a specific prompt"""
     image_path = Path(image_path)
-
     ann_file = Path(data_dir) / "_annotations.coco.json"
+    
     if not ann_file.exists():
         return [], None
 
@@ -198,13 +200,24 @@ def load_ground_truth(image_path, data_dir):
     categories = {cat['id']: cat['name'] for cat in coco_data['categories']}
     annotations = [ann for ann in coco_data['annotations'] if ann['image_id'] == image_info['id']]
 
-    gt_masks = []
     orig_h, orig_w = image_info['height'], image_info['width']
+    
+    # 1. 先确定这张图片的 Target Prompt（这里依然取第一个出现的有效类别）
     prompt = None
-
     for ann in annotations:
-        if prompt is None and ann['category_id'] in categories:
+        if ann['category_id'] in categories:
             prompt = categories[ann['category_id']]
+            break
+            
+    if prompt is None:
+        return [], None
+
+    # 2. 遍历标注，只提取与目标 Prompt 匹配的 Mask
+    gt_masks = []
+    for ann in annotations:
+        # 如果当前标注的类别不等于我们刚刚选定的 prompt，直接跳过
+        if categories.get(ann['category_id']) != prompt:
+            continue
 
         segmentation = ann.get('segmentation', None)
         if segmentation:
@@ -217,7 +230,6 @@ def load_ground_truth(image_path, data_dir):
                     mask_np = mask_utils.decode(rle)
                 else:
                     continue
-
                 gt_masks.append(mask_np)
             except Exception as e:
                 print(f"Error processing annotation: {e}")
@@ -256,12 +268,14 @@ def create_combined_visualization(image_results, output_path):
         axes[idx, 0].set_title(f'GT ({len(gt_masks)})', fontsize=12, fontweight='bold')
         axes[idx, 0].axis('off')
 
-        # Add image name on the left
-        axes[idx, 0].text(-0.1, 0.5, image_name,
+        # Add image name and prompt on the left
+        label_text = f"{image_name}\n[ {prompt} ]"
+        axes[idx, 0].text(-0.15, 0.5, label_text,
                          transform=axes[idx, 0].transAxes,
-                         fontsize=10, rotation=90,
+                         fontsize=12, rotation=90,
                          verticalalignment='center',
-                         horizontalalignment='right')
+                         horizontalalignment='right',
+                         fontweight='bold')
 
         # LoRA predictions
         axes[idx, 1].imshow(pil_image)
@@ -283,10 +297,13 @@ def create_combined_visualization(image_results, output_path):
         axes[idx, 2].set_title(f'Base ({base_count})', fontsize=12, fontweight='bold')
         axes[idx, 2].axis('off')
 
-    plt.suptitle(f'Model Comparison - Prompt: "{image_results[0]["prompt"]}"',
-                 fontsize=16, fontweight='bold', y=0.995)
+    # 修改全局标题，不要硬编码为第一张图的 prompt
+    plt.suptitle('Model Comparison (LoRA vs Base)', 
+                 fontsize=18, fontweight='bold', y=0.995)
 
     plt.tight_layout()
+    # 稍微增加一下左侧边距，防止字被截断
+    plt.subplots_adjust(left=0.08) 
     plt.savefig(output_path, bbox_inches='tight', dpi=150)
     plt.close()
 
