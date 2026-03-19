@@ -495,6 +495,11 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
     indices = range(len(dataset)) if image_ids is None else image_ids
 
     for idx in tqdm(list(indices), desc="Creating GT"):
+        # Check if idx is within valid range
+        if idx >= len(dataset):
+            print(f"[WARNING] Skipping index {idx} - out of range (dataset length: {len(dataset)})")
+            continue
+            
         coco_gt['images'].append({
             'id': int(idx),
             'width': mask_resolution,
@@ -816,7 +821,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     model = build_sam3_image_model(
         device=device.type,
         compile=False,
-        load_from_HF=True,
+        checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+        load_from_HF=False,
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=False
     )
@@ -998,6 +1004,21 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         image_ids=all_image_ids,
         mask_resolution=288
     )
+    
+    # Filter predictions to only include images that exist in the ground truth
+    print(f"\n[INFO] Filtering predictions to match ground truth images...")
+    gt_image_ids = set(img['id'] for img in coco_gt_dict['images'])
+    filtered_predictions = []
+    filtered_image_ids = []
+    
+    for img_id, preds in zip(all_image_ids, all_predictions):
+        if img_id in gt_image_ids:
+            filtered_predictions.append(preds)
+            filtered_image_ids.append(img_id)
+        else:
+            print(f"[INFO] Skipping predictions for image {img_id} (not in ground truth)")
+    
+    print(f"[INFO] Filtered {len(all_predictions)} -> {len(filtered_predictions)} predictions")
 
     # Check prediction scores (optional - can be commented out for speed)
     # print(f"\n[INFO] Analyzing prediction scores...")
@@ -1011,8 +1032,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
     # Convert predictions using SAM3's NMS pipeline or crack merging
     coco_predictions = convert_predictions_to_coco_format(
-        all_predictions,
-        all_image_ids,
+        filtered_predictions,
+        filtered_image_ids,
         resolution=288,
         prob_threshold=prob_threshold,
         nms_iou_threshold=nms_iou,
