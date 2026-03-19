@@ -1,7 +1,5 @@
-
 #!/usr/bin/env python3
-"""
-SAM3 LoRA Training Script
+"""SAM3 LoRA Training Script
 
 Validation Strategy (Following SAM3):
   - During training: Only compute validation LOSS (fast, no metrics)
@@ -21,50 +19,70 @@ Multi-GPU Training:
     CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_sam3_lora_native.py --config configs/full_lora_config.yaml --multi-gpu
 """
 
-import os
 import argparse
-import yaml
 import json
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-from torch.optim import AdamW
-from tqdm import tqdm
+import os
 from pathlib import Path
+
 import numpy as np
-from PIL import Image as PILImage
-import contextlib
+import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
+import torch
 
 # Distributed training imports
 import torch.distributed as dist
+import yaml
+from PIL import Image as PILImage
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from torchvision.transforms import v2
+from tqdm import tqdm
+
+from lora_layers import (
+    LoRAConfig,
+    apply_lora_to_model,
+    count_parameters,
+    save_lora_weights,
+)
+from sam3.model.model_misc import SAM3Output
 
 # SAM3 Imports
 from sam3.model_builder import build_sam3_image_model
-from sam3.model.model_misc import SAM3Output
-from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
-from sam3.train.loss.sam3_loss import Sam3LossWrapper
-from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
-from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
-from sam3.model.box_ops import box_xywh_to_xyxy
-from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
-
-from torchvision.transforms import v2
-import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
+from sam3.train.data.sam3_image_dataset import (
+    Datapoint,
+    FindQueryLoaded,
+    Image,
+    InferenceMetadata,
+    Object,
+)
+from sam3.train.loss.loss_fns import CORE_LOSS_KEY, Boxes, IABCEMdetr, Masks
+from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
+from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
 
 
 # ============================================================================
-# Distributed Training Utilities
+# 分布式训练工具函数 (Distributed Training Utilities)
 # ============================================================================
 
+
 def setup_distributed():
-    """Initialize distributed training environment."""
+    """
+    初始化分布式训练环境。
+
+    配置 NCCL 后端，并将当前进程绑定到指定的局部 GPU (LOCAL_RANK)。
+
+    返回:
+        int: 当前进程的局部排名 (Local Rank)。
+
+    调用说明:
+        >>> local_rank = setup_distributed()
+    """
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
@@ -75,195 +93,252 @@ def setup_distributed():
 
 
 def cleanup_distributed():
-    """Clean up distributed training."""
+    """
+    清理分布式训练资源。
+
+    在训练结束时销毁进程组。
+
+    调用说明:
+        >>> cleanup_distributed()
+    """
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def is_main_process():
-    """Check if this is the main process (rank 0)."""
+    """
+    检查当前是否为主进程 (Rank 0)。
+
+    用于控制日志打印、模型保存等仅需执行一次的操作。
+
+    返回:
+        bool: 如果是主进程或非分布式环境则返回 True，否则返回 False。
+    """
     if not dist.is_initialized():
         return True
     return dist.get_rank() == 0
 
 
 def get_world_size():
-    """Get the number of processes."""
+    """
+    获取分布式训练的总进程数 (GPU 总数)。
+
+    返回:
+        int: 进程总数。
+    """
     if not dist.is_initialized():
         return 1
     return dist.get_world_size()
 
 
 def get_rank():
-    """Get the rank of current process."""
+    """
+    获取当前进程的全局排名 (Rank)。
+
+    返回:
+        int: 当前进程的 Rank。
+    """
     if not dist.is_initialized():
         return 0
     return dist.get_rank()
 
 
 def print_rank0(*args, **kwargs):
-    """Print only on rank 0."""
+    """
+    仅在主进程 (Rank 0) 中打印信息。
+
+    参数:
+        *args: 打印内容位置参数。
+        **kwargs: 打印内容关键字参数。
+    """
     if is_main_process():
         print(*args, **kwargs)
 
 
 class COCOSegmentDataset(Dataset):
-    """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train"):
+    """
+    用于加载 COCO 格式分割数据的数据集类。
+
+    该类负责读取 COCO JSON 标注文件，加载图像，并将标注（边界框和多边形/RLE 掩码）
+    转换为 SAM3 模型训练所需的格式。
+
+    属性:
+        data_dir (Path): 包含训练/验证/测试文件夹的根目录。
+        split (str): 数据拆分类型 ('train', 'valid', 'test')。
+        resolution (int): 图像缩放的目标分辨率，默认为 1008。
+    """
+
+    def __init__(self, data_dir: str, split: str = "train"):
         """
-        Args:
-            data_dir: Root directory containing train/valid/test folders
-            split: One of 'train', 'valid', 'test'
+        初始化数据集。
+
+        参数:
+            data_dir (str): 根目录路径。
+            split (str): 'train', 'valid' 或 'test'。
+
+        异常:
+            FileNotFoundError: 如果在指定路径找不到 COCO 标注文件。
         """
         self.data_dir = Path(data_dir)
         self.split = split
         self.split_dir = self.data_dir / split
 
-        # Load COCO annotations
+        # 加载 COCO 标注
         ann_file = self.split_dir / "_annotations.coco.json"
         if not ann_file.exists():
-            raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
+            raise FileNotFoundError(f"未找到 COCO 标注文件: {ann_file}")
 
-        with open(ann_file, 'r') as f:
+        with open(ann_file) as f:
             self.coco_data = json.load(f)
 
-        # Build index: image_id -> image info
-        self.images = {img['id']: img for img in self.coco_data['images']}
+        # 构建索引: image_id -> 图像信息
+        self.images = {img["id"]: img for img in self.coco_data["images"]}
         self.image_ids = sorted(list(self.images.keys()))
 
-        # Build index: image_id -> list of annotations
+        # 构建索引: image_id -> 标注列表
         self.img_to_anns = {}
-        for ann in self.coco_data['annotations']:
-            img_id = ann['image_id']
+        for ann in self.coco_data["annotations"]:
+            img_id = ann["image_id"]
             if img_id not in self.img_to_anns:
                 self.img_to_anns[img_id] = []
             self.img_to_anns[img_id].append(ann)
 
-        # Load categories
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
-        print(f"Loaded COCO dataset: {split} split")
-        print(f"  Images: {len(self.image_ids)}")
-        print(f"  Annotations: {len(self.coco_data['annotations'])}")
-        print(f"  Categories: {self.categories}")
+        # 加载类别信息
+        self.categories = {
+            cat["id"]: cat["name"] for cat in self.coco_data["categories"]
+        }
+        print(f"已加载 COCO 数据集: {split} 分组")
+        print(f"  图像总数: {len(self.image_ids)}")
+        print(f"  标注总数: {len(self.coco_data['annotations'])}")
+        print(f"  类别列表: {self.categories}")
 
         self.resolution = 1008
-        self.transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        self.transform = v2.Compose(
+            [
+                v2.ToImage(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """返回数据集中的图像总数。"""
         return len(self.image_ids)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Datapoint:
+        """
+        获取指定索引的数据点。
+
+        读取图像并处理其关联的所有标注，转换为 SAM3 内部使用的 Datapoint 对象。
+
+        参数:
+            idx (int): 索引。
+
+        返回:
+            Datapoint: 包含图像数据、对象标注和查询信息的对象。
+        """
         img_id = self.image_ids[idx]
         img_info = self.images[img_id]
 
-        # Load image
-        img_path = self.split_dir / img_info['file_name']
+        # 加载图像
+        img_path = self.split_dir / img_info["file_name"]
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
-        # Resize image
-        pil_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
+        # 缩放图像
+        pil_image = pil_image.resize(
+            (self.resolution, self.resolution), PILImage.BILINEAR
+        )
 
-        # Transform to tensor
+        # 转换为张量
         image_tensor = self.transform(pil_image)
 
-        # Get annotations for this image
+        # 获取该图像的标注
         annotations = self.img_to_anns.get(img_id, [])
 
         objects = []
         object_class_names = []
 
-        # Scale factors
+        # 缩放因子
         scale_w = self.resolution / orig_w
         scale_h = self.resolution / orig_h
 
         for i, ann in enumerate(annotations):
-            # Get bbox - format is [x, y, width, height] in COCO format
+            # 获取边界框 - COCO 格式为 [x, y, width, height]
             bbox_coco = ann.get("bbox", None)
             if bbox_coco is None:
                 continue
 
-            # Get class name from category_id
+            # 从 category_id 获取类别名称
             category_id = ann.get("category_id", 0)
             class_name = self.categories.get(category_id, "object")
             object_class_names.append(class_name)
 
-            # Convert from COCO [x, y, w, h] to normalized [cx, cy, w, h] (CxCyWH)
-            # SAM3 internally expects boxes in CxCyWH format normalized to [0, 1]
+            # 转换为归一化的 CxCyWH 格式
             x, y, w, h = bbox_coco
             cx = x + w / 2.0
             cy = y + h / 2.0
 
-            # Scale to resolution and normalize to [0, 1]
-            box_tensor = torch.tensor([
-                cx * scale_w / self.resolution,
-                cy * scale_h / self.resolution,
-                w * scale_w / self.resolution,
-                h * scale_h / self.resolution,
-            ], dtype=torch.float32)
+            # 缩放并归一化到 [0, 1]
+            box_tensor = torch.tensor(
+                [
+                    cx * scale_w / self.resolution,
+                    cy * scale_h / self.resolution,
+                    w * scale_w / self.resolution,
+                    h * scale_h / self.resolution,
+                ],
+                dtype=torch.float32,
+            )
 
-            # Handle segmentation mask (polygon or RLE format)
+            # 处理分割掩码 (多边形或 RLE 格式)
             segment = None
             segmentation = ann.get("segmentation", None)
 
             if segmentation:
                 try:
-                    # Check if it's RLE format (dict) or polygon format (list)
                     if isinstance(segmentation, dict):
-                        # RLE format: {"counts": "...", "size": [h, w]}
+                        # RLE 格式
                         mask_np = mask_utils.decode(segmentation)
                     elif isinstance(segmentation, list):
-                        # Polygon format: [[x1, y1, x2, y2, ...], ...]
-                        # Convert polygon to RLE, then decode
+                        # 多边形格式
                         rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
                         rle = mask_utils.merge(rles)
                         mask_np = mask_utils.decode(rle)
                     else:
-                        print(f"Warning: Unknown segmentation format: {type(segmentation)}")
                         segment = None
                         continue
 
-                    # Resize mask to model resolution
+                    # 缩放到模型分辨率
                     mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
                     mask_t = torch.nn.functional.interpolate(
-                        mask_t,
-                        size=(self.resolution, self.resolution),
-                        mode="nearest"
+                        mask_t, size=(self.resolution, self.resolution), mode="nearest"
                     )
-                    segment = mask_t.squeeze() > 0.5  # [1008, 1008] boolean tensor
+                    segment = mask_t.squeeze() > 0.5  # [1008, 1008] 布尔张量
 
                 except Exception as e:
-                    print(f"Warning: Error processing mask for image {img_id}, ann {i}: {e}")
+                    print(f"警告: 处理图像 {img_id} 掩码时出错: {e}")
                     segment = None
 
             obj = Object(
                 bbox=box_tensor,
                 area=(box_tensor[2] * box_tensor[3]).item(),
                 object_id=i,
-                segment=segment
+                segment=segment,
             )
             objects.append(obj)
 
         image_obj = Image(
-            data=image_tensor,
-            objects=objects,
-            size=(self.resolution, self.resolution)
+            data=image_tensor, objects=objects, size=(self.resolution, self.resolution)
         )
 
-        # Construct Queries - one per unique category
-        # Each query maps to only the objects of that category
         from collections import defaultdict
 
-        # Group object IDs by their class name
+        # 按类别名称分组对象 ID
         class_to_object_ids = defaultdict(list)
         for obj, class_name in zip(objects, object_class_names):
             class_to_object_ids[class_name.lower()].append(obj.object_id)
 
-        # Create one query per category
+        # 每个类别创建一个查询
         queries = []
         if len(class_to_object_ids) > 0:
             for query_text, obj_ids in class_to_object_ids.items():
@@ -279,12 +354,12 @@ class COCOSegmentDataset(Dataset):
                         original_category_id=0,
                         original_size=(orig_h, orig_w),
                         object_id=-1,
-                        frame_index=-1
-                    )
+                        frame_index=-1,
+                    ),
                 )
                 queries.append(query)
         else:
-            # No annotations: create a single generic query
+            # 无标注时，创建一个通用查询
             query = FindQueryLoaded(
                 query_text="object",
                 image_id=0,
@@ -297,30 +372,35 @@ class COCOSegmentDataset(Dataset):
                     original_category_id=0,
                     original_size=(orig_h, orig_w),
                     object_id=-1,
-                    frame_index=-1
-                )
+                    frame_index=-1,
+                ),
             )
             queries.append(query)
 
         return Datapoint(
-            find_queries=queries,
-            images=[image_obj],
-            raw_images=[pil_image]
+            find_queries=queries, images=[image_obj], raw_images=[pil_image]
         )
 
 
-def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
+def merge_overlapping_masks(
+    binary_masks: torch.Tensor,
+    scores: torch.Tensor,
+    boxes: torch.Tensor,
+    iou_threshold: float = 0.3,
+):
     """
-    Merge overlapping masks that likely represent the same object.
+    合并重叠程度较高的预测掩码。
 
-    Args:
-        binary_masks: Binary masks [N, H, W]
-        scores: Confidence scores [N]
-        boxes: Bounding boxes [N, 4]
-        iou_threshold: IoU threshold for merging (default: 0.3)
+    通过 IoU 判定重叠，将属于同一物体的多个碎裂掩码合并为一个。
 
-    Returns:
-        Tuple of (merged_masks, merged_scores, merged_boxes)
+    参数:
+        binary_masks (torch.Tensor): 二值掩码张量，形状为 [N, H, W]。
+        scores (torch.Tensor): 置信度分数，形状为 [N]。
+        boxes (torch.Tensor): 边界框，形状为 [N, 4]。
+        iou_threshold (float, 可选): 合并的 IoU 阈值，默认 0.3。
+
+    返回:
+        tuple: 包含 (合并后的掩码, 合并后的分数, 合并后的框)。
     """
     if len(binary_masks) == 0:
         return binary_masks, scores, boxes
@@ -377,96 +457,112 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
     return merged_masks, merged_scores, merged_boxes
 
 
-def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False):
+def convert_predictions_to_coco_format(
+    predictions_list,
+    image_ids,
+    resolution=288,
+    score_threshold=0.0,
+    merge_overlaps=True,
+    iou_threshold=0.3,
+    debug=False,
+):
     """
-    Convert model predictions to COCO format for evaluation.
+    将模型预测结果转换为 COCO 格式。
 
-    OPTIMIZATION: Keep masks at native model output resolution (288×288)
-    GT is downsampled to match, so no upsampling needed!
+    优化策略：掩码保持在模型原生输出分辨率 (288x288)，对应的 Ground Truth 也会被降采样，
+    这样可以显著加快计算速度，无需进行大图上采样。
 
-    Args:
-        predictions_list: List of prediction dictionaries from the model
-        image_ids: List of image IDs corresponding to predictions
-        resolution: Mask resolution for evaluation (default: 288, model's native output)
-        score_threshold: Minimum score threshold for predictions
-        merge_overlaps: Whether to merge overlapping predictions (default: True)
-        iou_threshold: IoU threshold for merging overlaps (default: 0.3)
-        debug: Print debug information
+    参数:
+        predictions_list (list): 模型输出的预测字典列表。
+        image_ids (list): 与预测对应的图像 ID 列表。
+        resolution (int, 可选): 掩码分辨率，默认 288。
+        score_threshold (float, 可选): 置信度阈值。
+        merge_overlaps (bool, 可选): 是否合并重叠预测，默认 True。
+        iou_threshold (float, 可选): 合并 IoU 阈值，默认 0.3。
+        debug (bool, 可选): 是否打印调试信息。
 
-    Returns:
-        List of prediction dictionaries in COCO format
+    返回:
+        list: COCO 格式的预测字典列表。
     """
     coco_predictions = []
     pred_id = 0
 
     for img_id, preds in zip(image_ids, predictions_list):
-        if preds is None or len(preds.get('pred_logits', [])) == 0:
+        if preds is None or len(preds.get("pred_logits", [])) == 0:
             continue
 
-        # Extract predictions
-        logits = preds['pred_logits']  # [num_queries, 1]
-        boxes = preds['pred_boxes']    # [num_queries, 4]
-        masks = preds['pred_masks']    # [num_queries, H, W]
+        # 提取预测结果
+        logits = preds["pred_logits"]  # [num_queries, 1]
+        boxes = preds["pred_boxes"]  # [num_queries, 4]
+        masks = preds["pred_masks"]  # [num_queries, H, W]
 
         scores = torch.sigmoid(logits).squeeze(-1)  # [num_queries]
 
-        # Filter by score threshold
+        # 按置信度阈值过滤
         valid_mask = scores > score_threshold
         num_before = len(scores)
         scores = scores[valid_mask]
         boxes = boxes[valid_mask]
         masks = masks[valid_mask]
 
-        if debug and img_id == image_ids[0]:  # Debug first image only
-            print(f"  Image {img_id}: {num_before} queries -> {len(scores)} after filtering (threshold={score_threshold})")
+        if debug and img_id == image_ids[0]:  # 仅对首张图进行调试打印
+            print(
+                f"  图像 {img_id}: {num_before} 个查询 -> 过滤后剩余 {len(scores)} 个 (阈值={score_threshold})"
+            )
 
-        # Convert masks to binary (apply sigmoid first, then threshold)
+        # 转换为二值掩码
         binary_masks = (torch.sigmoid(masks) > 0.5).cpu()
 
-        # Merge overlapping predictions to avoid over-segmentation penalty
+        # 合并重叠预测，避免过度分割惩罚
         if merge_overlaps and len(binary_masks) > 0:
             num_before_merge = len(binary_masks)
             binary_masks, scores, boxes = merge_overlapping_masks(
                 binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
             )
             if debug and img_id == image_ids[0]:
-                print(f"  Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
+                print(
+                    f"  合并前 {num_before_merge} 个 -> 合并后 {len(binary_masks)} 个 (IoU 阈值={iou_threshold})"
+                )
 
-        # Encode masks to RLE (at native resolution - much faster!)
+        # 编码为 RLE (原生分辨率下非常快)
         if len(binary_masks) > 0:
-            # Check if masks have content
             mask_areas = binary_masks.flatten(1).sum(1)
 
             if debug and img_id == image_ids[0]:
-                print(f"  Mask shape: {binary_masks.shape}")
-                print(f"  Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}")
+                print(f"  掩码形状: {binary_masks.shape}")
+                print(
+                    f"  面积统计: 最小={mask_areas.min():.0f}, 最大={mask_areas.max():.0f}, 平均={mask_areas.float().mean():.0f}"
+                )
 
             rles = rle_encode(binary_masks)
 
-            for idx, (rle, score, box) in enumerate(zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())):
-                # Convert box from normalized [cx, cy, w, h] to [x, y, w, h] in pixel coordinates
+            for _idx, (rle, score, box) in enumerate(
+                zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())
+            ):
+                # 将归一化的 CxCyWH 转换为像素坐标下的 [x, y, w, h]
                 cx, cy, w, h = box
-                x = (cx - w/2) * resolution
-                y = (cy - h/2) * resolution
+                x = (cx - w / 2) * resolution
+                y = (cy - h / 2) * resolution
                 w = w * resolution
                 h = h * resolution
 
-                coco_predictions.append({
-                    'image_id': int(img_id),
-                    'category_id': 1,  # Single category for instance segmentation
-                    'segmentation': rle,
-                    'bbox': [float(x), float(y), float(w), float(h)],
-                    'score': float(score),
-                    'id': pred_id
-                })
+                coco_predictions.append(
+                    {
+                        "image_id": int(img_id),
+                        "category_id": 1,
+                        "segmentation": rle,
+                        "bbox": [float(x), float(y), float(w), float(h)],
+                        "score": float(score),
+                        "id": pred_id,
+                    }
+                )
                 pred_id += 1
 
     return coco_predictions
 
 
 def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
-    """
-    Create COCO ground truth dictionary from SimpleSAM3Dataset.
+    """Create COCO ground truth dictionary from SimpleSAM3Dataset.
 
     OPTIMIZATION: Downsample GT masks to match prediction resolution (288×288)
     instead of upsampling predictions to 1008×1008. Much faster!
@@ -480,14 +576,14 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
         Dictionary in COCO format
     """
     coco_gt = {
-        'info': {
-            'description': 'SAM3 LoRA Validation Dataset',
-            'version': '1.0',
-            'year': 2024
+        "info": {
+            "description": "SAM3 LoRA Validation Dataset",
+            "version": "1.0",
+            "year": 2024,
         },
-        'images': [],
-        'annotations': [],
-        'categories': [{'id': 1, 'name': 'object'}]
+        "images": [],
+        "annotations": [],
+        "categories": [{"id": 1, "name": "object"}],
     }
 
     ann_id = 0
@@ -498,12 +594,14 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
 
     for idx in indices:
         # Add image entry at mask resolution
-        coco_gt['images'].append({
-            'id': int(idx),
-            'width': mask_resolution,
-            'height': mask_resolution,
-            'is_instance_exhaustive': True  # Required for cgF1 evaluation
-        })
+        coco_gt["images"].append(
+            {
+                "id": int(idx),
+                "width": mask_resolution,
+                "height": mask_resolution,
+                "is_instance_exhaustive": True,  # Required for cgF1 evaluation
+            }
+        )
 
         # Get datapoint
         datapoint = dataset[idx]
@@ -515,40 +613,51 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
             x, y, w, h = cx - bw / 2, cy - bh / 2, bw, bh
 
             ann = {
-                'id': ann_id,
-                'image_id': int(idx),
-                'category_id': 1,
-                'bbox': [x, y, w, h],
-                'area': w * h,
-                'iscrowd': 0,
-                'ignore': 0
+                "id": ann_id,
+                "image_id": int(idx),
+                "category_id": 1,
+                "bbox": [x, y, w, h],
+                "area": w * h,
+                "iscrowd": 0,
+                "ignore": 0,
             }
 
             # Add segmentation if available - downsample to mask_resolution
             if obj.segment is not None:
                 # Downsample mask from 1008×1008 to mask_resolution×mask_resolution
                 mask_tensor = obj.segment.unsqueeze(0).unsqueeze(0).float()
-                downsampled_mask = torch.nn.functional.interpolate(
-                    mask_tensor,
-                    size=(mask_resolution, mask_resolution),
-                    mode='bilinear',
-                    align_corners=False
-                ) > 0.5
+                downsampled_mask = (
+                    torch.nn.functional.interpolate(
+                        mask_tensor,
+                        size=(mask_resolution, mask_resolution),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    > 0.5
+                )
 
                 mask_np = downsampled_mask.squeeze().cpu().numpy().astype(np.uint8)
                 rle = mask_utils.encode(np.asfortranarray(mask_np))
-                rle['counts'] = rle['counts'].decode('utf-8')
-                ann['segmentation'] = rle
+                rle["counts"] = rle["counts"].decode("utf-8")
+                ann["segmentation"] = rle
 
-            coco_gt['annotations'].append(ann)
+            coco_gt["annotations"].append(ann)
             ann_id += 1
 
     return coco_gt
 
 
-def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False):
-    """
-    Convert model predictions to COCO format at ORIGINAL image resolution.
+def convert_predictions_to_coco_format_original_res(
+    predictions_list,
+    image_ids,
+    dataset,
+    model_resolution=288,
+    score_threshold=0.0,
+    merge_overlaps=True,
+    iou_threshold=0.3,
+    debug=False,
+):
+    """Convert model predictions to COCO format at ORIGINAL image resolution.
 
     This matches the inference approach (infer_sam.py) where:
     1. Masks are upsampled from 288x288 to original image size
@@ -569,21 +678,25 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
     pred_id = 0
 
     if debug:
-        print(f"\n[DEBUG] Converting {len(predictions_list)} predictions to COCO format (ORIGINAL RESOLUTION)...")
+        print(
+            f"\n[DEBUG] Converting {len(predictions_list)} predictions to COCO format (ORIGINAL RESOLUTION)..."
+        )
         if merge_overlaps:
-            print(f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={iou_threshold})")
+            print(
+                f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={iou_threshold})"
+            )
 
     for img_id, preds in zip(image_ids, predictions_list):
-        if preds is None or len(preds.get('pred_logits', [])) == 0:
+        if preds is None or len(preds.get("pred_logits", [])) == 0:
             continue
 
         # Get original image size from dataset
         datapoint = dataset[img_id]
         orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
 
-        logits = preds['pred_logits']
-        boxes = preds['pred_boxes']
-        masks = preds['pred_masks']  # [N, 288, 288]
+        logits = preds["pred_logits"]
+        boxes = preds["pred_boxes"]
+        masks = preds["pred_masks"]  # [N, 288, 288]
 
         scores = torch.sigmoid(logits).squeeze(-1)
 
@@ -595,10 +708,14 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
         masks = masks[valid_mask]
 
         if debug and img_id == image_ids[0]:
-            print(f"[DEBUG] Image {img_id}: {num_before} queries -> {len(scores)} after filtering (threshold={score_threshold})")
+            print(
+                f"[DEBUG] Image {img_id}: {num_before} queries -> {len(scores)} after filtering (threshold={score_threshold})"
+            )
             if len(scores) > 0:
                 print(f"[DEBUG]   Original size: {orig_w}x{orig_h}")
-                print(f"[DEBUG]   Filtered scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}")
+                print(
+                    f"[DEBUG]   Filtered scores: min={scores.min():.4f}, max={scores.max():.4f}, mean={scores.mean():.4f}"
+                )
 
         if len(masks) == 0:
             continue
@@ -609,8 +726,8 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
         masks_upsampled = torch.nn.functional.interpolate(
             masks_sigmoid.unsqueeze(1).float(),  # [N, 1, 288, 288]
             size=(orig_h, orig_w),
-            mode='bilinear',
-            align_corners=False
+            mode="bilinear",
+            align_corners=False,
         ).squeeze(1)  # [N, orig_h, orig_w]
 
         binary_masks = (masks_upsampled > 0.5).cpu()
@@ -626,22 +743,28 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
                 binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
             )
             if debug and img_id == image_ids[0]:
-                print(f"[DEBUG]   Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
+                print(
+                    f"[DEBUG]   Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})"
+                )
 
         if len(binary_masks) > 0:
             mask_areas = binary_masks.flatten(1).sum(1)
 
             if debug and img_id == image_ids[0]:
                 print(f"[DEBUG]   Upsampled mask shape: {binary_masks.shape}")
-                print(f"[DEBUG]   Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}")
+                print(
+                    f"[DEBUG]   Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}"
+                )
 
             rles = rle_encode(binary_masks)
 
-            for idx, (rle, score, box) in enumerate(zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())):
+            for idx, (rle, score, box) in enumerate(
+                zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())
+            ):
                 # Convert box from normalized [0,1] to original image coordinates
                 cx, cy, w_norm, h_norm = box
-                x = (cx - w_norm/2) * orig_w
-                y = (cy - h_norm/2) * orig_h
+                x = (cx - w_norm / 2) * orig_w
+                y = (cy - h_norm / 2) * orig_h
                 w = w_norm * orig_w
                 h = h_norm * orig_h
 
@@ -656,16 +779,18 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
                     continue
 
                 pred_dict = {
-                    'image_id': int(img_id),
-                    'category_id': 1,
-                    'segmentation': rle,
-                    'bbox': [float(x), float(y), float(w), float(h)],
-                    'score': float(score),
-                    'id': pred_id
+                    "image_id": int(img_id),
+                    "category_id": 1,
+                    "segmentation": rle,
+                    "bbox": [float(x), float(y), float(w), float(h)],
+                    "score": float(score),
+                    "id": pred_id,
                 }
 
                 if debug and img_id == image_ids[0] and idx == 0:
-                    print(f"[DEBUG]   First prediction bbox (at {orig_w}x{orig_h}): {pred_dict['bbox']}")
+                    print(
+                        f"[DEBUG]   First prediction bbox (at {orig_w}x{orig_h}): {pred_dict['bbox']}"
+                    )
 
                 coco_predictions.append(pred_dict)
                 pred_id += 1
@@ -674,8 +799,7 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
 
 
 def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=False):
-    """
-    Create COCO ground truth dictionary from dataset at ORIGINAL resolution.
+    """Create COCO ground truth dictionary from dataset at ORIGINAL resolution.
 
     This matches the inference approach (infer_sam.py) where GT is kept
     at original image size for evaluation.
@@ -686,17 +810,17 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
         debug: Print debug info
     """
     if debug:
-        print(f"\n[DEBUG] Creating COCO ground truth (ORIGINAL RESOLUTION)...")
+        print("\n[DEBUG] Creating COCO ground truth (ORIGINAL RESOLUTION)...")
 
     coco_gt = {
-        'info': {
-            'description': 'SAM3 LoRA Validation Dataset',
-            'version': '1.0',
-            'year': 2024
+        "info": {
+            "description": "SAM3 LoRA Validation Dataset",
+            "version": "1.0",
+            "year": 2024,
         },
-        'images': [],
-        'annotations': [],
-        'categories': [{'id': 1, 'name': 'object'}]
+        "images": [],
+        "annotations": [],
+        "categories": [{"id": 1, "name": "object"}],
     }
 
     ann_id = 0
@@ -708,12 +832,14 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
         # Get original image size
         orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
 
-        coco_gt['images'].append({
-            'id': int(idx),
-            'width': orig_w,
-            'height': orig_h,
-            'is_instance_exhaustive': True
-        })
+        coco_gt["images"].append(
+            {
+                "id": int(idx),
+                "width": orig_w,
+                "height": orig_h,
+                "is_instance_exhaustive": True,
+            }
+        )
 
         for obj in datapoint.images[0].objects:
             # Convert normalized CxCyWH box to COCO [x, y, w, h] at original size
@@ -724,46 +850,53 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
             y = cy * orig_h - h / 2
 
             ann = {
-                'id': ann_id,
-                'image_id': int(idx),
-                'category_id': 1,
-                'bbox': [x, y, w, h],
-                'area': w * h,
-                'iscrowd': 0,
-                'ignore': 0
+                "id": ann_id,
+                "image_id": int(idx),
+                "category_id": 1,
+                "bbox": [x, y, w, h],
+                "area": w * h,
+                "iscrowd": 0,
+                "ignore": 0,
             }
 
             if obj.segment is not None:
                 # Upsample mask from 1008x1008 to original size
                 mask_tensor = obj.segment.unsqueeze(0).unsqueeze(0).float()
-                upsampled_mask = torch.nn.functional.interpolate(
-                    mask_tensor,
-                    size=(orig_h, orig_w),
-                    mode='bilinear',
-                    align_corners=False
-                ) > 0.5
+                upsampled_mask = (
+                    torch.nn.functional.interpolate(
+                        mask_tensor,
+                        size=(orig_h, orig_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    > 0.5
+                )
 
                 mask_np = upsampled_mask.squeeze().cpu().numpy().astype(np.uint8)
                 rle = mask_utils.encode(np.asfortranarray(mask_np))
-                rle['counts'] = rle['counts'].decode('utf-8')
-                ann['segmentation'] = rle
+                rle["counts"] = rle["counts"].decode("utf-8")
+                ann["segmentation"] = rle
 
-            coco_gt['annotations'].append(ann)
+            coco_gt["annotations"].append(ann)
             ann_id += 1
 
     if debug:
-        print(f"[DEBUG] Created {len(coco_gt['images'])} images, {len(coco_gt['annotations'])} annotations")
-        if len(coco_gt['annotations']) > 0:
-            sample_gt = coco_gt['annotations'][0]
-            sample_img = coco_gt['images'][0]
-            print(f"[DEBUG] Sample GT: image_id={sample_gt['image_id']}, bbox={sample_gt['bbox']}, image_size={sample_img['width']}x{sample_img['height']}")
+        print(
+            f"[DEBUG] Created {len(coco_gt['images'])} images, {len(coco_gt['annotations'])} annotations"
+        )
+        if len(coco_gt["annotations"]) > 0:
+            sample_gt = coco_gt["annotations"][0]
+            sample_img = coco_gt["images"][0]
+            print(
+                f"[DEBUG] Sample GT: image_id={sample_gt['image_id']}, bbox={sample_gt['bbox']}, image_size={sample_img['width']}x{sample_img['height']}"
+            )
 
     return coco_gt
 
 
 class SAM3TrainerNative:
     def __init__(self, config_path, multi_gpu=False):
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             self.config = yaml.safe_load(f)
 
         # Multi-GPU setup
@@ -787,7 +920,7 @@ class SAM3TrainerNative:
             checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # Set to None to load from HF
             load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=False
+            eval_mode=False,
         )
 
         # Apply LoRA
@@ -808,7 +941,9 @@ class SAM3TrainerNative:
         self.model = apply_lora_to_model(self.model, lora_config)
 
         stats = count_parameters(self.model)
-        print_rank0(f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
+        print_rank0(
+            f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)"
+        )
 
         self.model.to(self.device)
 
@@ -818,9 +953,9 @@ class SAM3TrainerNative:
                 self.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=False  # Frozen params (requires_grad=False) don't need this flag
+                find_unused_parameters=False,  # Frozen params (requires_grad=False) don't need this flag
             )
-            print_rank0(f"Model wrapped with DistributedDataParallel")
+            print_rank0("Model wrapped with DistributedDataParallel")
 
         # Store reference to unwrapped model for accessing custom methods
         self._unwrapped_model = self.model.module if self.multi_gpu else self.model
@@ -829,9 +964,9 @@ class SAM3TrainerNative:
         self.optimizer = AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=float(self.config["training"]["learning_rate"]),
-            weight_decay=self.config["training"]["weight_decay"]
+            weight_decay=self.config["training"]["weight_decay"],
         )
-        
+
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
             cost_class=2.0, cost_bbox=5.0, cost_giou=2.0, focal=True
@@ -840,16 +975,10 @@ class SAM3TrainerNative:
         # Create loss functions with correct weights (from original SAM3 training config)
         # Note: These weights are for mask-based training
         loss_fns = [
-            Boxes(weight_dict={
-                "loss_bbox": 5.0,
-                "loss_giou": 2.0
-            }),
+            Boxes(weight_dict={"loss_bbox": 5.0, "loss_giou": 2.0}),
             IABCEMdetr(
                 pos_weight=10.0,
-                weight_dict={
-                    "loss_ce": 20.0,
-                    "presence_loss": 20.0
-                },
+                weight_dict={"loss_ce": 20.0, "presence_loss": 20.0},
                 pos_focal=False,
                 alpha=0.25,
                 gamma=2,
@@ -859,20 +988,16 @@ class SAM3TrainerNative:
             Masks(
                 weight_dict={
                     "loss_mask": 200.0,  # Much higher weight for mask loss!
-                    "loss_dice": 10.0
+                    "loss_dice": 10.0,
                 },
                 focal_alpha=0.25,
                 focal_gamma=2.0,
-                compute_aux=False
-            )
+                compute_aux=False,
+            ),
         ]
 
         # Create one-to-many matcher for auxiliary outputs
-        o2m_matcher = BinaryOneToManyMatcher(
-            alpha=0.3,
-            threshold=0.4,
-            topk=4
-        )
+        o2m_matcher = BinaryOneToManyMatcher(alpha=0.3, threshold=0.4, topk=4)
 
         # Use Sam3LossWrapper for proper loss computation
         self.loss_wrapper = Sam3LossWrapper(
@@ -884,7 +1009,7 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
-        
+
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
@@ -904,7 +1029,7 @@ class SAM3TrainerNative:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")
             else:
-                print_rank0(f"Validation dataset is empty.")
+                print_rank0("Validation dataset is empty.")
                 val_ds = None
         except Exception as e:
             print_rank0(f"Could not load validation data: {e}")
@@ -922,17 +1047,11 @@ class SAM3TrainerNative:
 
         if self.multi_gpu:
             train_sampler = DistributedSampler(
-                train_ds,
-                num_replicas=self.world_size,
-                rank=get_rank(),
-                shuffle=True
+                train_ds, num_replicas=self.world_size, rank=get_rank(), shuffle=True
             )
             if has_validation:
                 val_sampler = DistributedSampler(
-                    val_ds,
-                    num_replicas=self.world_size,
-                    rank=get_rank(),
-                    shuffle=False
+                    val_ds, num_replicas=self.world_size, rank=get_rank(), shuffle=False
                 )
 
         train_loader = DataLoader(
@@ -942,7 +1061,7 @@ class SAM3TrainerNative:
             sampler=train_sampler,
             collate_fn=collate_fn,
             num_workers=self.config["training"].get("num_workers", 0),
-            pin_memory=True
+            pin_memory=True,
         )
 
         if has_validation:
@@ -953,7 +1072,7 @@ class SAM3TrainerNative:
                 sampler=val_sampler,
                 collate_fn=collate_fn,
                 num_workers=self.config["training"].get("num_workers", 0),
-                pin_memory=True
+                pin_memory=True,
             )
         else:
             val_loader = None
@@ -966,33 +1085,37 @@ class SAM3TrainerNative:
             "loss_bbox": 5.0,
             "loss_giou": 2.0,
             "loss_mask": 5.0,
-            "loss_dice": 5.0
+            "loss_dice": 5.0,
         }
 
         epochs = self.config["training"]["num_epochs"]
-        best_val_loss = float('inf')
+        best_val_loss = float("inf")
         print_rank0(f"Starting training for {epochs} epochs...")
 
         if has_validation:
-            print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
+            print_rank0(
+                f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}"
+            )
         else:
             print_rank0(f"Training samples: {len(train_ds)}")
             print_rank0("⚠️  No validation data found - training without validation")
 
         if self.multi_gpu:
-            print_rank0(f"Effective batch size: {self.config['training']['batch_size']} x {self.world_size} = {self.config['training']['batch_size'] * self.world_size}")
+            print_rank0(
+                f"Effective batch size: {self.config['training']['batch_size']} x {self.world_size} = {self.config['training']['batch_size'] * self.world_size}"
+            )
 
         # Helper to move BatchedDatapoint to device
         def move_to_device(obj, device):
             if isinstance(obj, torch.Tensor):
                 return obj.to(device)
-            elif isinstance(obj, list):
+            if isinstance(obj, list):
                 return [move_to_device(x, device) for x in obj]
-            elif isinstance(obj, tuple):
+            if isinstance(obj, tuple):
                 return tuple(move_to_device(x, device) for x in obj)
-            elif isinstance(obj, dict):
+            if isinstance(obj, dict):
                 return {k: move_to_device(v, device) for k, v in obj.items()}
-            elif hasattr(obj, "__dataclass_fields__"):
+            if hasattr(obj, "__dataclass_fields__"):
                 for field in obj.__dataclass_fields__:
                     val = getattr(obj, field)
                     setattr(obj, field, move_to_device(val, device))
@@ -1012,7 +1135,9 @@ class SAM3TrainerNative:
             train_losses = []
 
             # Only show progress bar on rank 0
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
+            pbar = tqdm(
+                train_loader, desc=f"Epoch {epoch + 1}", disable=not is_main_process()
+            )
             for batch_dict in pbar:
                 input_batch = batch_dict["input"]
 
@@ -1025,7 +1150,10 @@ class SAM3TrainerNative:
 
                 # Prepare targets for loss
                 # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
-                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                find_targets = [
+                    self._unwrapped_model.back_convert(target)
+                    for target in input_batch.find_targets
+                ]
 
                 # Move targets to device
                 for targets in find_targets:
@@ -1067,7 +1195,9 @@ class SAM3TrainerNative:
                 pbar.set_postfix({"loss": total_loss.item()})
 
             # Calculate average training loss for this epoch
-            avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
+            avg_train_loss = (
+                sum(train_losses) / len(train_losses) if train_losses else 0.0
+            )
 
             # Validation (only compute loss - no metrics, like SAM3)
             if has_validation and val_loader is not None:
@@ -1075,7 +1205,9 @@ class SAM3TrainerNative:
                 val_losses = []
 
                 with torch.no_grad():
-                    val_pbar = tqdm(val_loader, desc=f"Validation", disable=not is_main_process())
+                    val_pbar = tqdm(
+                        val_loader, desc="Validation", disable=not is_main_process()
+                    )
 
                     for batch_dict in val_pbar:
                         input_batch = batch_dict["input"]
@@ -1085,7 +1217,10 @@ class SAM3TrainerNative:
                         outputs_list = self.model(input_batch)
 
                         # Prepare targets
-                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                        find_targets = [
+                            self._unwrapped_model.back_convert(target)
+                            for target in input_batch.find_targets
+                        ]
 
                         # Move targets to device
                         for targets in find_targets:
@@ -1095,15 +1230,24 @@ class SAM3TrainerNative:
 
                         # Add matcher indices to outputs (required by Sam3LossWrapper)
                         with SAM3Output.iteration_mode(
-                            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                            outputs_list,
+                            iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE,
                         ) as outputs_iter:
-                            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                                stage_targets_list = [stage_targets] * len(stage_outputs)
-                                for outputs, targets in zip(stage_outputs, stage_targets_list):
+                            for stage_outputs, stage_targets in zip(
+                                outputs_iter, find_targets
+                            ):
+                                stage_targets_list = [stage_targets] * len(
+                                    stage_outputs
+                                )
+                                for outputs, targets in zip(
+                                    stage_outputs, stage_targets_list
+                                ):
                                     outputs["indices"] = self.matcher(outputs, targets)
                                     if "aux_outputs" in outputs:
                                         for aux_out in outputs["aux_outputs"]:
-                                            aux_out["indices"] = self.matcher(aux_out, targets)
+                                            aux_out["indices"] = self.matcher(
+                                                aux_out, targets
+                                            )
 
                         # Compute loss using Sam3LossWrapper
                         loss_dict = self.loss_wrapper(outputs_list, find_targets)
@@ -1120,26 +1264,37 @@ class SAM3TrainerNative:
                     dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
                     avg_val_loss = val_loss_tensor.item()
 
-                print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+                print_rank0(
+                    f"\nEpoch {epoch + 1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+                )
 
                 # Save models based on validation loss (only on rank 0)
                 if is_main_process():
                     # Get underlying model from DDP wrapper
                     model_to_save = self.model.module if self.multi_gpu else self.model
-                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                    save_lora_weights(
+                        model_to_save, str(out_dir / "last_lora_weights.pt")
+                    )
 
                     if avg_val_loss < best_val_loss:
                         best_val_loss = avg_val_loss
-                        save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"))
+                        save_lora_weights(
+                            model_to_save, str(out_dir / "best_lora_weights.pt")
+                        )
                         print(f"✓ New best model saved (val_loss: {avg_val_loss:.6f})")
 
                     # Log to file
                     with open(out_dir / "val_stats.json", "a") as f:
-                        f.write(json.dumps({
-                            "epoch": epoch + 1,
-                            "train_loss": avg_train_loss,
-                            "val_loss": avg_val_loss
-                        }) + "\n")
+                        f.write(
+                            json.dumps(
+                                {
+                                    "epoch": epoch + 1,
+                                    "train_loss": avg_train_loss,
+                                    "val_loss": avg_val_loss,
+                                }
+                            )
+                            + "\n"
+                        )
 
                 torch.cuda.empty_cache()
 
@@ -1149,7 +1304,9 @@ class SAM3TrainerNative:
                 # No validation - just save model each epoch (only on rank 0)
                 if is_main_process():
                     model_to_save = self.model.module if self.multi_gpu else self.model
-                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                    save_lora_weights(
+                        model_to_save, str(out_dir / "last_lora_weights.pt")
+                    )
 
         # Synchronize before final save
         if self.multi_gpu:
@@ -1158,39 +1315,43 @@ class SAM3TrainerNative:
         # Final save (only on rank 0)
         if is_main_process():
             if has_validation:
-                print(f"\n{'='*80}")
-                print(f"✅ Training complete!")
-                print(f"{'='*80}")
+                print(f"\n{'=' * 80}")
+                print("✅ Training complete!")
+                print(f"{'=' * 80}")
                 print(f"Best validation loss: {best_val_loss:.6f}")
                 print(f"\nModels saved to {out_dir}:")
-                print(f"  - best_lora_weights.pt (best validation loss)")
-                print(f"  - last_lora_weights.pt (last epoch)")
-                print(f"\n📊 To compute full metrics (mAP, cgF1) with NMS:")
-                print(f"   python validate_sam3_lora.py \\")
-                print(f"     --config <config_path> \\")
+                print("  - best_lora_weights.pt (best validation loss)")
+                print("  - last_lora_weights.pt (last epoch)")
+                print("\n📊 To compute full metrics (mAP, cgF1) with NMS:")
+                print("   python validate_sam3_lora.py \\")
+                print("     --config <config_path> \\")
                 print(f"     --weights {out_dir}/best_lora_weights.pt \\")
-                print(f"     --val_data_dir <data_dir>/valid")
-                print(f"{'='*80}")
+                print("     --val_data_dir <data_dir>/valid")
+                print(f"{'=' * 80}")
             else:
                 # If no validation, copy last to best
                 import shutil
+
                 last_path = out_dir / "last_lora_weights.pt"
                 best_path = out_dir / "best_lora_weights.pt"
                 if last_path.exists():
                     shutil.copy(last_path, best_path)
 
-                print(f"\n{'='*80}")
-                print(f"✅ Training complete!")
-                print(f"{'='*80}")
+                print(f"\n{'=' * 80}")
+                print("✅ Training complete!")
+                print(f"{'=' * 80}")
                 print(f"\nModels saved to {out_dir}:")
-                print(f"  - best_lora_weights.pt (copy of last epoch)")
-                print(f"  - last_lora_weights.pt (last epoch)")
-                print(f"\nℹ️  No validation data - consider adding data/valid/ for better model selection")
-                print(f"{'='*80}")
+                print("  - best_lora_weights.pt (copy of last epoch)")
+                print("  - last_lora_weights.pt (last epoch)")
+                print(
+                    "\nℹ️  No validation data - consider adding data/valid/ for better model selection"
+                )
+                print(f"{'=' * 80}")
 
         # Cleanup distributed training
         if self.multi_gpu:
             cleanup_distributed()
+
 
 def launch_distributed_training(args):
     """Launch training with multiple GPUs using torchrun subprocess."""
@@ -1206,13 +1367,18 @@ def launch_distributed_training(args):
 
     # Build the command
     cmd = [
-        sys.executable, "-m", "torch.distributed.run",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         f"--nproc_per_node={num_gpus}",
-        "--master_port", str(args.master_port),
+        "--master_port",
+        str(args.master_port),
         sys.argv[0],  # This script
-        "--config", args.config,
-        "--device", *map(str, devices),
-        "--_launched_by_torchrun"  # Internal flag to indicate we're in subprocess
+        "--config",
+        args.config,
+        "--device",
+        *map(str, devices),
+        "--_launched_by_torchrun",  # Internal flag to indicate we're in subprocess
     ]
 
     # Set environment variable for visible devices
@@ -1244,13 +1410,13 @@ Examples:
 
   Multi-GPU (all 4 GPUs):
     python train_sam3_lora_native.py --config configs/full_lora_config.yaml --device 0 1 2 3
-        """
+        """,
     )
     parser.add_argument(
         "--config",
         type=str,
         default="configs/full_lora_config.yaml",
-        help="Path to YAML configuration file"
+        help="Path to YAML configuration file",
     )
     parser.add_argument(
         "--device",
@@ -1258,24 +1424,24 @@ Examples:
         nargs="+",
         default=[0],
         help="GPU device ID(s) to use. Single value for single GPU, multiple values for multi-GPU. "
-             "Example: --device 0 (single GPU), --device 0 1 2 (3 GPUs)"
+        "Example: --device 0 (single GPU), --device 0 1 2 (3 GPUs)",
     )
     parser.add_argument(
         "--master_port",
         type=int,
         default=29500,
-        help="Master port for distributed training (default: 29500)"
+        help="Master port for distributed training (default: 29500)",
     )
     parser.add_argument(
         "--local_rank",
         type=int,
         default=-1,
-        help="Local rank for distributed training (set automatically by torchrun)"
+        help="Local rank for distributed training (set automatically by torchrun)",
     )
     parser.add_argument(
         "--_launched_by_torchrun",
         action="store_true",
-        help=argparse.SUPPRESS  # Hidden argument for internal use
+        help=argparse.SUPPRESS,  # Hidden argument for internal use
     )
     args = parser.parse_args()
 
