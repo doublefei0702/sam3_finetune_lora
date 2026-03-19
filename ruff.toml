@@ -1,0 +1,37 @@
+# Ruff 配置文件
+# 针对 sam3_finetune_lora 项目优化
+
+# 目标 Python 版本
+target-version = "py38"
+
+# 每行最大长度限制
+line-length = 88
+
+[lint]
+# 启用默认规则集合
+# E: pycodestyle
+# F: Pyflakes
+# I: isort (导入排序)
+# D: pydocstyle (文档字符串检查)
+# N: pep8-naming (命名规范)
+# UP: pyupgrade (语法升级)
+select = ["E", "F", "I", "D", "N", "UP", "B", "A", "C4", "SIM", "ARG", "RET", "RUF"]
+
+# 忽略特定规则
+ignore = [
+    "D100", # 不强制要求每个文件都有模块级文档字符串
+    "D104", # 不强制要求 __init__.py 有文档字符串
+    "D203", # 与 D211 冲突
+    "D213", # 与 D212 冲突
+]
+
+[lint.pydocstyle]
+# 使用 Google 风格的文档字符串规范
+convention = "google"
+
+[format]
+# 格式化设置
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
